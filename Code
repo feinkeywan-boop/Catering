@@ -1,0 +1,608 @@
+“””
+🍹 CocktailFinance – Finanzverwaltung für mobilen Cocktail Caterer
+Abhängigkeiten: streamlit, pandas, plotly
+Installation: pip install streamlit pandas plotly
+Start: streamlit run cocktail_caterer_app.py
+“””
+
+import sqlite3
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import date, datetime
+from pathlib import Path
+
+# ─────────────────────────────────────────────
+
+# KONFIGURATION & DATENBANK
+
+# ─────────────────────────────────────────────
+
+DB_PATH = “cocktail_caterer.db”
+
+st.set_page_config(
+page_title=“CocktailFinance”,
+page_icon=“🍹”,
+layout=“wide”,
+initial_sidebar_state=“expanded”,
+)
+
+# Custom CSS – elegantes dunkles Design
+
+st.markdown(”””
+
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700&family=DM+Sans:wght@300;400;500&display=swap');
+
+    html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
+
+    .stApp { background: #0f0f0f; color: #f0ede8; }
+
+    h1, h2, h3 { font-family: 'Playfair Display', serif; color: #f0ede8; }
+
+    .metric-card {
+        background: linear-gradient(135deg, #1a1a1a 0%, #242424 100%);
+        border: 1px solid #2e2e2e;
+        border-radius: 12px;
+        padding: 20px;
+        text-align: center;
+        margin-bottom: 8px;
+    }
+    .metric-value {
+        font-size: 2rem;
+        font-weight: 700;
+        font-family: 'Playfair Display', serif;
+    }
+    .metric-label {
+        font-size: 0.8rem;
+        color: #888;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+    }
+    .positive { color: #4ade80; }
+    .negative { color: #f87171; }
+    .neutral  { color: #facc15; }
+
+    .stSelectbox > div, .stTextInput > div > div, .stNumberInput > div > div {
+        background: #1a1a1a !important;
+        border-color: #333 !important;
+        color: #f0ede8 !important;
+    }
+    .stDataFrame { background: #1a1a1a; }
+    div[data-testid="stSidebarContent"] { background: #141414; }
+    .stButton > button {
+        background: #c9a84c;
+        color: #0f0f0f;
+        font-weight: 600;
+        border: none;
+        border-radius: 8px;
+        padding: 0.5rem 1.5rem;
+    }
+    .stButton > button:hover { background: #e0bc6a; }
+    hr { border-color: #2e2e2e; }
+    .stTabs [data-baseweb="tab"] { color: #888; }
+    .stTabs [aria-selected="true"] { color: #c9a84c !important; border-bottom-color: #c9a84c !important; }
+</style>
+
+“””, unsafe_allow_html=True)
+
+def get_conn():
+return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+def init_db():
+conn = get_conn()
+cur = conn.cursor()
+
+```
+cur.executescript("""
+CREATE TABLE IF NOT EXISTS cocktails (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    name    TEXT NOT NULL UNIQUE,
+    price   REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS zutaten (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL UNIQUE,
+    einheit         TEXT NOT NULL DEFAULT 'ml',
+    kosten_pro_einheit REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS cocktail_zutaten (
+    cocktail_id INTEGER REFERENCES cocktails(id) ON DELETE CASCADE,
+    zutaten_id  INTEGER REFERENCES zutaten(id)  ON DELETE CASCADE,
+    menge       REAL NOT NULL,
+    PRIMARY KEY (cocktail_id, zutaten_id)
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL,
+    datum           TEXT NOT NULL,
+    abrechnung      TEXT NOT NULL,   -- 'pauschale' | 'pro_person' | 'kombi'
+    pauschale       REAL DEFAULT 0,
+    preis_pro_kopf  REAL DEFAULT 0,
+    gaeste          INTEGER DEFAULT 0,
+    extras          REAL DEFAULT 0,
+    notizen         TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS event_cocktails (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id    INTEGER REFERENCES events(id) ON DELETE CASCADE,
+    cocktail_id INTEGER REFERENCES cocktails(id),
+    menge       INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS event_kosten (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id    INTEGER REFERENCES events(id) ON DELETE CASCADE,
+    kategorie   TEXT NOT NULL DEFAULT 'Zutaten/Waren',
+    beschreibung TEXT,
+    betrag      REAL NOT NULL
+);
+""")
+conn.commit()
+conn.close()
+```
+
+init_db()
+
+# ─────────────────────────────────────────────
+
+# HILFSFUNKTIONEN
+
+# ─────────────────────────────────────────────
+
+def umsatz_event(event: dict) -> float:
+typ = event[“abrechnung”]
+if typ == “pauschale”:
+return event[“pauschale”]
+elif typ == “pro_person”:
+return event[“preis_pro_kopf”] * event[“gaeste”]
+else:  # kombi
+return event[“pauschale”] + (event[“preis_pro_kopf”] * event[“gaeste”]) + event[“extras”]
+
+def kosten_event(event_id: int) -> float:
+conn = get_conn()
+row = conn.execute(“SELECT COALESCE(SUM(betrag),0) FROM event_kosten WHERE event_id=?”, (event_id,)).fetchone()
+conn.close()
+return row[0]
+
+def rohkosten_cocktail(cocktail_id: int) -> float:
+“”“Materialkosten eines Cocktails anhand seiner Rezeptur.”””
+conn = get_conn()
+rows = conn.execute(”””
+SELECT z.kosten_pro_einheit * cz.menge
+FROM cocktail_zutaten cz
+JOIN zutaten z ON z.id = cz.zutaten_id
+WHERE cz.cocktail_id = ?
+“””, (cocktail_id,)).fetchall()
+conn.close()
+return sum(r[0] for r in rows)
+
+def deckungsbeitrag_cocktail(cocktail_id: int, verkaufspreis: float) -> float:
+return verkaufspreis - rohkosten_cocktail(cocktail_id)
+
+def alle_events_df() -> pd.DataFrame:
+conn = get_conn()
+df = pd.read_sql(“SELECT * FROM events ORDER BY datum DESC”, conn)
+conn.close()
+if df.empty:
+return df
+df[“umsatz”] = df.apply(umsatz_event, axis=1)
+df[“kosten”] = df[“id”].apply(kosten_event)
+df[“gewinn”] = df[“umsatz”] - df[“kosten”]
+df[“marge_%”] = df.apply(lambda r: (r[“gewinn”] / r[“umsatz”] * 100) if r[“umsatz”] else 0, axis=1)
+df[“datum”] = pd.to_datetime(df[“datum”])
+df[“monat”] = df[“datum”].dt.to_period(“M”).astype(str)
+df[“jahr”] = df[“datum”].dt.year
+return df
+
+# ─────────────────────────────────────────────
+
+# SIDEBAR NAVIGATION
+
+# ─────────────────────────────────────────────
+
+with st.sidebar:
+st.markdown(”## 🍹 CocktailFinance”)
+st.markdown(”—”)
+seite = st.radio(
+“Navigation”,
+[“📊 Dashboard”, “🎉 Events”, “🍸 Cocktails & Rezepte”, “🧪 Zutaten”, “📈 Auswertungen”],
+label_visibility=“collapsed”,
+)
+
+# ─────────────────────────────────────────────
+
+# SEITE: DASHBOARD
+
+# ─────────────────────────────────────────────
+
+if seite == “📊 Dashboard”:
+st.markdown(”# 📊 Dashboard”)
+st.markdown(“Deine Finanzkennzahlen auf einen Blick.”)
+st.markdown(”—”)
+
+```
+df = alle_events_df()
+
+if df.empty:
+    st.info("Noch keine Events erfasst. Erstelle dein erstes Event unter **🎉 Events**.")
+else:
+    # KPI-Karten
+    gesamt_umsatz = df["umsatz"].sum()
+    gesamt_kosten = df["kosten"].sum()
+    gesamt_gewinn = df["gewinn"].sum()
+    marge = gesamt_gewinn / gesamt_umsatz * 100 if gesamt_umsatz else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    for col, label, wert, fmt, cls in [
+        (c1, "Gesamtumsatz",  gesamt_umsatz,  f"{gesamt_umsatz:,.2f} €",  "neutral"),
+        (c2, "Gesamtkosten",  gesamt_kosten,  f"{gesamt_kosten:,.2f} €",  "negative"),
+        (c3, "Gesamtgewinn",  gesamt_gewinn,  f"{gesamt_gewinn:,.2f} €",  "positive" if gesamt_gewinn >= 0 else "negative"),
+        (c4, "Ø Marge",       marge,          f"{marge:.1f} %",           "positive" if marge >= 30 else "neutral"),
+    ]:
+        col.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">{label}</div>
+            <div class="metric-value {cls}">{fmt}</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # Umsatz vs. Kosten vs. Gewinn – letzte Events
+    col_l, col_r = st.columns(2)
+    with col_l:
+        st.subheader("Umsatz · Kosten · Gewinn pro Event")
+        fig = go.Figure()
+        fig.add_bar(name="Umsatz", x=df["name"], y=df["umsatz"], marker_color="#c9a84c")
+        fig.add_bar(name="Kosten", x=df["name"], y=df["kosten"], marker_color="#f87171")
+        fig.add_bar(name="Gewinn", x=df["name"], y=df["gewinn"], marker_color="#4ade80")
+        fig.update_layout(
+            barmode="group", paper_bgcolor="#0f0f0f", plot_bgcolor="#0f0f0f",
+            font_color="#f0ede8", legend=dict(bgcolor="#1a1a1a"),
+            margin=dict(l=0, r=0, t=10, b=0),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_r:
+        st.subheader("Monatliche Gewinnentwicklung")
+        mon = df.groupby("monat")[["umsatz", "gewinn"]].sum().reset_index()
+        fig2 = px.line(
+            mon, x="monat", y="gewinn", markers=True,
+            color_discrete_sequence=["#c9a84c"],
+        )
+        fig2.update_layout(
+            paper_bgcolor="#0f0f0f", plot_bgcolor="#0f0f0f",
+            font_color="#f0ede8", margin=dict(l=0, r=0, t=10, b=0),
+            xaxis_title="", yaxis_title="Gewinn (€)",
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+```
+
+# ─────────────────────────────────────────────
+
+# SEITE: EVENTS
+
+# ─────────────────────────────────────────────
+
+elif seite == “🎉 Events”:
+st.markdown(”# 🎉 Events”)
+tab1, tab2 = st.tabs([“➕ Neues Event”, “📋 Alle Events”])
+
+```
+# ── Neues Event anlegen ──
+with tab1:
+    st.subheader("Event erfassen")
+    with st.form("event_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        name   = c1.text_input("Event-Name *", placeholder="z.B. Hochzeit Meyer")
+        datum  = c2.date_input("Datum *", value=date.today())
+
+        abrechnung = st.selectbox(
+            "Abrechnungsmodell *",
+            ["pauschale", "pro_person", "kombi"],
+            format_func=lambda x: {
+                "pauschale": "Pauschale (Fixpreis)",
+                "pro_person": "Pro Person / Kopfpauschale",
+                "kombi": "Kombination (Pauschale + Pro Kopf + Extras)",
+            }[x],
+        )
+
+        col1, col2, col3, col4 = st.columns(4)
+        pauschale      = col1.number_input("Pauschale (€)", min_value=0.0, step=50.0)
+        preis_pro_kopf = col2.number_input("Preis/Person (€)", min_value=0.0, step=1.0)
+        gaeste         = col3.number_input("Gästeanzahl", min_value=0, step=1)
+        extras         = col4.number_input("Extras-Umsatz (€)", min_value=0.0, step=10.0)
+
+        notizen = st.text_area("Notizen", height=80)
+
+        # Kostenblock
+        st.markdown("**Kosten für dieses Event**")
+        k1, k2, k3 = st.columns([2, 3, 2])
+        kost_kat  = k1.selectbox("Kategorie", ["Zutaten/Waren", "Personal", "Transport", "Equipment", "Sonstiges"])
+        kost_bez  = k2.text_input("Beschreibung", placeholder="z.B. Spirituosen Einkauf")
+        kost_bet  = k3.number_input("Betrag (€)", min_value=0.0, step=5.0)
+
+        submitted = st.form_submit_button("💾 Event speichern")
+
+    if submitted:
+        if not name:
+            st.error("Bitte einen Event-Namen eingeben.")
+        else:
+            conn = get_conn()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO events (name, datum, abrechnung, pauschale, preis_pro_kopf, gaeste, extras, notizen)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (name, str(datum), abrechnung, pauschale, preis_pro_kopf, gaeste, extras, notizen))
+            eid = cur.lastrowid
+            if kost_bet > 0:
+                cur.execute("""
+                    INSERT INTO event_kosten (event_id, kategorie, beschreibung, betrag)
+                    VALUES (?,?,?,?)
+                """, (eid, kost_kat, kost_bez, kost_bet))
+            conn.commit()
+            conn.close()
+            st.success(f"✅ Event **{name}** gespeichert!")
+
+# ── Alle Events ──
+with tab2:
+    df = alle_events_df()
+    if df.empty:
+        st.info("Noch keine Events vorhanden.")
+    else:
+        anzeige = df[["name", "datum", "abrechnung", "gaeste", "umsatz", "kosten", "gewinn", "marge_%"]].copy()
+        anzeige.columns = ["Event", "Datum", "Modell", "Gäste", "Umsatz €", "Kosten €", "Gewinn €", "Marge %"]
+        anzeige["Datum"]    = anzeige["Datum"].dt.strftime("%d.%m.%Y")
+        anzeige["Umsatz €"] = anzeige["Umsatz €"].map("{:,.2f}".format)
+        anzeige["Kosten €"] = anzeige["Kosten €"].map("{:,.2f}".format)
+        anzeige["Gewinn €"] = anzeige["Gewinn €"].map("{:,.2f}".format)
+        anzeige["Marge %"]  = anzeige["Marge %"].map("{:.1f}".format)
+        st.dataframe(anzeige, use_container_width=True, hide_index=True)
+
+        # Kosten zu bestehendem Event hinzufügen
+        st.markdown("---")
+        st.subheader("Weitere Kosten zu Event hinzufügen")
+        ev_namen = df["name"].tolist()
+        ev_ids   = df["id"].tolist()
+        sel_ev   = st.selectbox("Event wählen", range(len(ev_namen)), format_func=lambda i: ev_namen[i])
+        with st.form("kosten_form"):
+            kc1, kc2, kc3 = st.columns([2, 3, 2])
+            k_kat = kc1.selectbox("Kategorie", ["Zutaten/Waren", "Personal", "Transport", "Equipment", "Sonstiges"])
+            k_bez = kc2.text_input("Beschreibung")
+            k_bet = kc3.number_input("Betrag (€)", min_value=0.0, step=5.0)
+            if st.form_submit_button("➕ Kosten hinzufügen"):
+                if k_bet > 0:
+                    conn = get_conn()
+                    conn.execute("INSERT INTO event_kosten (event_id, kategorie, beschreibung, betrag) VALUES (?,?,?,?)",
+                                 (ev_ids[sel_ev], k_kat, k_bez, k_bet))
+                    conn.commit()
+                    conn.close()
+                    st.success("Kosten hinzugefügt!")
+                    st.rerun()
+```
+
+# ─────────────────────────────────────────────
+
+# SEITE: COCKTAILS & REZEPTE
+
+# ─────────────────────────────────────────────
+
+elif seite == “🍸 Cocktails & Rezepte”:
+st.markdown(”# 🍸 Cocktails & Rezepte”)
+tab1, tab2 = st.tabs([“➕ Cocktail anlegen”, “📋 Cocktail-Übersicht”])
+
+```
+with tab1:
+    st.subheader("Neuen Cocktail mit Rezeptur erfassen")
+    conn = get_conn()
+    zutaten_rows = conn.execute("SELECT id, name, einheit, kosten_pro_einheit FROM zutaten ORDER BY name").fetchall()
+    conn.close()
+
+    with st.form("cocktail_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        cname  = c1.text_input("Cocktail-Name *", placeholder="z.B. Mojito Classic")
+        cpreis = c2.number_input("Verkaufspreis (€) *", min_value=0.0, step=0.5, value=12.0)
+
+        st.markdown("**Zutaten / Rezeptur** (nur bereits angelegte Zutaten verfügbar)")
+        if not zutaten_rows:
+            st.warning("Bitte zuerst Zutaten anlegen (Menü: 🧪 Zutaten).")
+        else:
+            zut_namen = {r[0]: f"{r[1]} ({r[2]})" for r in zutaten_rows}
+            rezeptur  = []
+            for i in range(5):
+                rc1, rc2 = st.columns([3, 1])
+                zut_id = rc1.selectbox(f"Zutat {i+1}", [0] + list(zut_namen.keys()),
+                                       format_func=lambda x: "– keine –" if x == 0 else zut_namen[x],
+                                       key=f"z{i}")
+                menge  = rc2.number_input(f"Menge", min_value=0.0, step=1.0, key=f"m{i}")
+                if zut_id and menge > 0:
+                    rezeptur.append((zut_id, menge))
+
+        if st.form_submit_button("💾 Cocktail speichern"):
+            if not cname:
+                st.error("Name fehlt.")
+            else:
+                conn = get_conn()
+                cur  = conn.cursor()
+                try:
+                    cur.execute("INSERT INTO cocktails (name, price) VALUES (?,?)", (cname, cpreis))
+                    cid = cur.lastrowid
+                    for zid, menge in rezeptur:
+                        cur.execute("INSERT OR REPLACE INTO cocktail_zutaten VALUES (?,?,?)", (cid, zid, menge))
+                    conn.commit()
+                    st.success(f"✅ Cocktail **{cname}** gespeichert!")
+                except sqlite3.IntegrityError:
+                    st.error(f"Cocktail **{cname}** existiert bereits.")
+                finally:
+                    conn.close()
+
+with tab2:
+    conn = get_conn()
+    cocktails = conn.execute("SELECT id, name, price FROM cocktails ORDER BY name").fetchall()
+    conn.close()
+
+    if not cocktails:
+        st.info("Noch keine Cocktails angelegt.")
+    else:
+        rows = []
+        for cid, cname, cpreis in cocktails:
+            roh  = rohkosten_cocktail(cid)
+            db   = deckungsbeitrag_cocktail(cid, cpreis)
+            dbp  = db / cpreis * 100 if cpreis else 0
+            rows.append({
+                "Cocktail": cname,
+                "Verkaufspreis €": f"{cpreis:.2f}",
+                "Rohkosten €": f"{roh:.2f}",
+                "Deckungsbeitrag €": f"{db:.2f}",
+                "DB-Marge %": f"{dbp:.1f}",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        # Deckungsbeitrags-Chart
+        namen = [r["Cocktail"] for r in rows]
+        dbs   = [float(r["Deckungsbeitrag €"]) for r in rows]
+        fig = px.bar(x=namen, y=dbs, color=dbs,
+                     color_continuous_scale=["#f87171", "#facc15", "#4ade80"],
+                     labels={"x": "Cocktail", "y": "DB (€)"})
+        fig.update_layout(paper_bgcolor="#0f0f0f", plot_bgcolor="#0f0f0f",
+                          font_color="#f0ede8", showlegend=False,
+                          coloraxis_showscale=False, margin=dict(l=0,r=0,t=10,b=0))
+        st.plotly_chart(fig, use_container_width=True)
+```
+
+# ─────────────────────────────────────────────
+
+# SEITE: ZUTATEN
+
+# ─────────────────────────────────────────────
+
+elif seite == “🧪 Zutaten”:
+st.markdown(”# 🧪 Zutaten / Warenstamm”)
+
+```
+with st.form("zutat_form", clear_on_submit=True):
+    c1, c2, c3 = st.columns(3)
+    zname  = c1.text_input("Zutat *", placeholder="z.B. Havana Club 3 Jahre")
+    einh   = c2.selectbox("Einheit", ["ml", "cl", "g", "kg", "Stück", "Liter"])
+    kpro   = c3.number_input("Kosten pro Einheit (€) *", min_value=0.0, step=0.01, format="%.4f")
+    if st.form_submit_button("➕ Zutat speichern"):
+        if zname:
+            conn = get_conn()
+            try:
+                conn.execute("INSERT INTO zutaten (name, einheit, kosten_pro_einheit) VALUES (?,?,?)",
+                             (zname, einh, kpro))
+                conn.commit()
+                st.success(f"✅ **{zname}** gespeichert.")
+            except sqlite3.IntegrityError:
+                st.error(f"**{zname}** existiert bereits.")
+            finally:
+                conn.close()
+
+st.markdown("---")
+conn = get_conn()
+zdf = pd.read_sql("SELECT name as Zutat, einheit as Einheit, kosten_pro_einheit as 'Kosten/Einheit €' FROM zutaten ORDER BY name", conn)
+conn.close()
+if not zdf.empty:
+    st.dataframe(zdf, use_container_width=True, hide_index=True)
+else:
+    st.info("Noch keine Zutaten angelegt.")
+```
+
+# ─────────────────────────────────────────────
+
+# SEITE: AUSWERTUNGEN
+
+# ─────────────────────────────────────────────
+
+elif seite == “📈 Auswertungen”:
+st.markdown(”# 📈 Auswertungen & Trends”)
+df = alle_events_df()
+
+```
+if df.empty:
+    st.info("Noch keine Events für Auswertungen vorhanden.")
+else:
+    tab1, tab2, tab3 = st.tabs(["📅 Monatliche Übersicht", "📆 Jahresvergleich", "🍸 Deckungsbeitrag"])
+
+    # ── Monatliche Übersicht ──
+    with tab1:
+        mon = df.groupby("monat").agg(
+            Events=("id", "count"),
+            Umsatz=("umsatz", "sum"),
+            Kosten=("kosten", "sum"),
+            Gewinn=("gewinn", "sum"),
+        ).reset_index().rename(columns={"monat": "Monat"})
+
+        st.dataframe(
+            mon.style.format({"Umsatz": "{:,.2f} €", "Kosten": "{:,.2f} €", "Gewinn": "{:,.2f} €"}),
+            use_container_width=True, hide_index=True,
+        )
+
+        fig = go.Figure()
+        fig.add_bar(name="Umsatz", x=mon["Monat"], y=mon["Umsatz"], marker_color="#c9a84c")
+        fig.add_bar(name="Kosten", x=mon["Monat"], y=mon["Kosten"], marker_color="#f87171")
+        fig.add_bar(name="Gewinn", x=mon["Monat"], y=mon["Gewinn"], marker_color="#4ade80")
+        fig.update_layout(barmode="group", paper_bgcolor="#0f0f0f", plot_bgcolor="#0f0f0f",
+                          font_color="#f0ede8", margin=dict(l=0,r=0,t=10,b=0))
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ── Jahresvergleich ──
+    with tab2:
+        jahr = df.groupby("jahr").agg(
+            Events=("id", "count"),
+            Umsatz=("umsatz", "sum"),
+            Kosten=("kosten", "sum"),
+            Gewinn=("gewinn", "sum"),
+        ).reset_index()
+        jahr["Marge %"] = jahr["Gewinn"] / jahr["Umsatz"] * 100
+
+        st.dataframe(
+            jahr.style.format({"Umsatz": "{:,.2f} €", "Kosten": "{:,.2f} €",
+                               "Gewinn": "{:,.2f} €", "Marge %": "{:.1f}%"}),
+            use_container_width=True, hide_index=True,
+        )
+
+        fig2 = px.line(jahr, x="jahr", y=["Umsatz", "Gewinn"],
+                       color_discrete_sequence=["#c9a84c", "#4ade80"], markers=True)
+        fig2.update_layout(paper_bgcolor="#0f0f0f", plot_bgcolor="#0f0f0f",
+                           font_color="#f0ede8", margin=dict(l=0,r=0,t=10,b=0),
+                           xaxis_title="Jahr", yaxis_title="€")
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # ── Deckungsbeitrag Cocktails ──
+    with tab3:
+        conn = get_conn()
+        cocktails = conn.execute("SELECT id, name, price FROM cocktails ORDER BY name").fetchall()
+        conn.close()
+
+        if not cocktails:
+            st.info("Noch keine Cocktails angelegt.")
+        else:
+            data = []
+            for cid, cname, cpreis in cocktails:
+                roh = rohkosten_cocktail(cid)
+                db  = cpreis - roh
+                data.append({"Cocktail": cname, "Verkaufspreis": cpreis,
+                             "Rohkosten": roh, "DB": db,
+                             "DB-Marge%": db/cpreis*100 if cpreis else 0})
+
+            cdf = pd.DataFrame(data)
+            fig3 = px.bar(cdf, x="Cocktail", y=["Rohkosten", "DB"],
+                          color_discrete_sequence=["#f87171", "#4ade80"],
+                          barmode="stack",
+                          labels={"value": "€", "variable": ""})
+            fig3.update_layout(paper_bgcolor="#0f0f0f", plot_bgcolor="#0f0f0f",
+                               font_color="#f0ede8", margin=dict(l=0,r=0,t=10,b=0))
+            st.plotly_chart(fig3, use_container_width=True)
+
+            st.dataframe(
+                cdf.style.format({"Verkaufspreis": "{:.2f} €", "Rohkosten": "{:.2f} €",
+                                  "DB": "{:.2f} €", "DB-Marge%": "{:.1f}%"}),
+                use_container_width=True, hide_index=True,
+            )
+```
